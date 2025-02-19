@@ -311,7 +311,8 @@ export async function sendCrossChainMessage(
       nonce: Math.floor(Math.random() * 1000000),
     };
 
-    const tx = await sourceChainInstance.sendMessageWithPayload({
+    // Güncel Wormhole SDK API'si: sendMessage
+    const tx = await sourceChainInstance.sendMessage({
       targetChain: targetChainInstance.chain,
       payload: message.payload,
       targetAddress: message.recipient,
@@ -333,7 +334,9 @@ export async function receiveCrossChainMessage(
   try {
     const targetChainInstance = targetChain === 'Solana' ? wormhole.solanaChain : wormhole.ethereumChain;
     const parsedVAA = await wormhole.parseVAA(vaaBytes);
-    const { receipt } = await targetChainInstance.redeemMessageWithPayload({
+
+    // Güncel Wormhole SDK API'si: receiveMessage
+    const { receipt } = await targetChainInstance.receiveMessage({
       vaa: parsedVAA,
       chain: targetChain,
     });
@@ -342,6 +345,19 @@ export async function receiveCrossChainMessage(
     return Buffer.from(parsedVAA.payload, 'hex');
   } catch (error) {
     throw new Error(`Crosschain mesaj alımı başarısız: ${error}`);
+  }
+}
+
+export async function fetchSignedVAA(
+  wormhole: any,
+  messageHash: string
+): Promise<Uint8Array> {
+  try {
+    // Güncel Wormhole SDK API'si: getSignedVAA
+    const vaaBytes = await wormhole.getSignedVAA(messageHash);
+    return vaaBytes;
+  } catch (error) {
+    throw new Error(`VAA çekilemedi: ${error}`);
   }
 }
 

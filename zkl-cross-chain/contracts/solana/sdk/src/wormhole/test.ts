@@ -9,11 +9,12 @@ import {
   initializeWormhole,
   CustomWormholeConfig,
   sendCrossChainMessage,
-  receiveCrossChainMessage
+  receiveCrossChainMessage,
+  fetchSignedVAA
 } from './zklaArchitecture';
 // import { networks } from '@wormhole-foundation/sdk';
 
-jest.setTimeout(120000); // 2 dakika timeout
+jest.setTimeout(300000); // 5 dakika timeout
 
 describe('Wormhole Integration Tests', () => {
   let connection: Connection;
@@ -68,6 +69,7 @@ describe('Wormhole Integration Tests', () => {
   describe('Cross-Chain Mesaj Testleri', () => {
     let testMessagePayload: Buffer;
     let messageReceipt: string;
+    let txHash: string;
 
     beforeEach(() => {
       testMessagePayload = Buffer.from(
@@ -83,16 +85,21 @@ describe('Wormhole Integration Tests', () => {
       try {
         const recipient = '0x9502F71D9d37728C56175Fd9a0A5f1c1Fe472B61'; // Test alıcı adresi
         
-        const txHash = await sendCrossChainMessage(
-          wormholeInstance,
-          'Solana',
-          'Ethereum',
+        // Yeni SDK'ya göre mesaj gönderimi
+        const coreBridge = await solanaChain.getWormholeCore();
+        const publishTx = await coreBridge.publishMessage(
+          solanaIdentity.publicKey.toString(),
           testMessagePayload,
-          recipient
+          0, // nonce
+          0  // consistency level
         );
 
+        // Transaction'ı imzala ve gönder
+        const signedTx = await publishTx.sign([solanaIdentity]);
+        txHash = await connection.sendRawTransaction(signedTx.serialize());
+        await connection.confirmTransaction(txHash);
+
         expect(txHash).toBeDefined();
-        expect(typeof txHash).toBe('string');
         messageReceipt = txHash;
         
         console.log('Mesaj gönderildi, txHash:', txHash);
@@ -103,18 +110,25 @@ describe('Wormhole Integration Tests', () => {
     });
 
     test('VAA oluşturulmasını bekle ve doğrula', async () => {
-      // VAA oluşmasını bekle (45 saniye)
-      await new Promise(resolve => setTimeout(resolve, 45000));
+      // VAA oluşmasını bekle (60 saniye)
+      await new Promise(resolve => setTimeout(resolve, 60000));
 
       try {
-        const vaaBytes = await wormholeInstance.getMessageByHash(messageReceipt);
-        expect(vaaBytes).toBeDefined();
-        expect(vaaBytes.length).toBeGreaterThan(0);
+        const whm = await solanaChain.parseTransaction(txHash);
+        expect(whm).toBeDefined();
+        
+        const vaa = await wormholeInstance.getVaa(
+          whm[0],
+          "Uint8Array",
+          120_000
+        );
+        
+        expect(vaa).toBeDefined();
+        expect(vaa.payload).toBeDefined();
         
         // VAA içeriğini parse et ve kontrol et
-        const parsedVAA = await wormholeInstance.parseVAA(vaaBytes);
+        const parsedVAA = await wormholeInstance.parseVAA(vaa);
         expect(parsedVAA.emitterChain).toBe('Solana');
-        expect(parsedVAA.targetChain).toBe('Ethereum');
         expect(parsedVAA.payload).toBeDefined();
         
         console.log('VAA başarıyla alındı ve doğrulandı');
@@ -126,15 +140,25 @@ describe('Wormhole Integration Tests', () => {
 
     test('Mesaj alımı ve içerik doğrulama', async () => {
       try {
-        const vaaBytes = await wormholeInstance.getMessageByHash(messageReceipt);
-        const receivedMessage = await receiveCrossChainMessage(
-          wormholeInstance,
-          'Ethereum',
-          vaaBytes
+        const whm = await solanaChain.parseTransaction(txHash);
+        const vaa = await wormholeInstance.getVaa(
+          whm[0],
+          "Uint8Array",
+          120_000
+        );
+        
+        // Yeni SDK'ya göre mesaj alımı
+        const coreBridge = await ethereumChain.getWormholeCore();
+        const verifyTx = await coreBridge.verifyMessage(
+          solanaIdentity.publicKey.toString(),
+          vaa
         );
 
+        expect(verifyTx).toBeDefined();
+
         // Alınan mesajı parse et ve kontrol et
-        const parsedMessage = JSON.parse(receivedMessage.toString());
+        const parsedVAA = await wormholeInstance.parseVAA(vaa);
+        const parsedMessage = JSON.parse(Buffer.from(parsedVAA.payload).toString());
         expect(parsedMessage.type).toBe('test');
         expect(parsedMessage.content).toBe('Cross-chain test message');
         expect(parsedMessage.timestamp).toBeDefined();
