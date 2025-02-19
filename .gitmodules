@@ -1,0 +1,6 @@
+[submodule "zkl-cross-chain/contracts/solana/wormhole-sdk"]
+	path = zkl-cross-chain/contracts/solana/wormhole-sdk
+	url = https://github.com/wormhole-foundation/wormhole.git
+[submodule "schemas"]
+	path = zkl-cross-chain/contracts/solana/schemas
+	url = https://github.com/wormhole-foundation/wormhole
