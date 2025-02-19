@@ -1,11 +1,144 @@
-import * as secp256k1 from 'secp256k1';
-import { webcrypto } from 'node:crypto';
-import * as nacl from 'tweetnacl';
-import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
-import { Buffer } from 'node:buffer';
+import { randomBytes, createCipheriv, createDecipheriv, createHash } from 'crypto';
+import secp256k1 from 'secp256k1';
+import { Buffer } from 'buffer';
 import { Connection, PublicKey } from '@solana/web3.js';
+import { encodeBase64, decodeBase64 } from 'tweetnacl-util';
 
-const crypto = webcrypto as any;
+// Web Crypto API için tip tanımları
+declare global {
+    var window: Window | undefined;
+    
+    interface CryptoKey {
+        type: string;
+        extractable: boolean;
+        algorithm: any;
+        usages: string[];
+    }
+    
+    interface Window {
+        crypto: {
+            subtle: {
+                importKey(
+                    format: string,
+                    keyData: ArrayBuffer,
+                    algorithm: { name: string },
+                    extractable: boolean,
+                    keyUsages: string[]
+                ): Promise<CryptoKey>;
+                deriveBits(
+                    algorithm: { name: string; hash: string; salt: Uint8Array; info: Uint8Array },
+                    key: CryptoKey,
+                    length: number
+                ): Promise<ArrayBuffer>;
+                encrypt(
+                    algorithm: { name: string; iv: Uint8Array; tagLength: number },
+                    key: CryptoKey,
+                    data: Uint8Array
+                ): Promise<ArrayBuffer>;
+                decrypt(
+                    algorithm: { name: string; iv: Uint8Array; tagLength: number },
+                    key: CryptoKey,
+                    data: Uint8Array
+                ): Promise<ArrayBuffer>;
+            };
+        };
+    }
+}
+
+// Node.js ortamında crypto modülünü kullan
+const cryptoModule = typeof window === 'undefined' ? require('crypto').webcrypto : window.crypto;
+
+export interface KeyPair {
+  publicKey: Buffer;
+  privateKey: Buffer;
+}
+
+export function generateKeyPair(): KeyPair {
+  let privateKey: Buffer;
+  do {
+    privateKey = randomBytes(32);
+  } while (!secp256k1.privateKeyVerify(privateKey));
+
+  const publicKey = Buffer.from(secp256k1.publicKeyCreate(privateKey));
+  return { publicKey, privateKey };
+}
+
+export function deriveSharedSecret(privateKey: Buffer, publicKey: Buffer): Buffer {
+  const sharedSecret = secp256k1.ecdh(publicKey, privateKey);
+  return createHash('sha256').update(sharedSecret).digest();
+}
+
+export function encrypt(data: Buffer, recipientPublicKey: Buffer): { 
+  ciphertext: Buffer; 
+  ephemeralPublicKey: Buffer;
+} {
+  // Geçici anahtar çifti oluştur
+  const ephemeralKeyPair = generateKeyPair();
+  
+  // Paylaşılan gizli anahtarı türet
+  const sharedSecret = deriveSharedSecret(
+    ephemeralKeyPair.privateKey,
+    recipientPublicKey
+  );
+
+  // IV oluştur
+  const iv = randomBytes(16);
+
+  // AES-256-GCM ile şifrele
+  const cipher = createCipheriv('aes-256-gcm', sharedSecret, iv);
+  const encrypted = Buffer.concat([
+    cipher.update(data),
+    cipher.final()
+  ]);
+
+  // Kimlik doğrulama etiketini al
+  const authTag = cipher.getAuthTag();
+
+  // Şifrelenmiş veriyi, IV ve kimlik doğrulama etiketini birleştir
+  const ciphertext = Buffer.concat([
+    iv,
+    encrypted,
+    authTag
+  ]);
+
+  return {
+    ciphertext,
+    ephemeralPublicKey: ephemeralKeyPair.publicKey
+  };
+}
+
+export function decrypt(
+  ciphertext: Buffer,
+  ephemeralPublicKey: Buffer,
+  recipientPrivateKey: Buffer
+): Buffer {
+  // Paylaşılan gizli anahtarı türet
+  const sharedSecret = deriveSharedSecret(
+    recipientPrivateKey,
+    ephemeralPublicKey
+  );
+
+  // IV, şifrelenmiş veri ve kimlik doğrulama etiketini ayır
+  const iv = ciphertext.slice(0, 16);
+  const authTag = ciphertext.slice(-16);
+  const encryptedData = ciphertext.slice(16, -16);
+
+  // AES-256-GCM ile deşifre et
+  const decipher = createDecipheriv('aes-256-gcm', sharedSecret, iv);
+  decipher.setAuthTag(authTag);
+
+  // Deşifre et ve sonucu döndür
+  return Buffer.concat([
+    decipher.update(encryptedData),
+    decipher.final()
+  ]);
+}
+
+export const zklCrypto = {
+  generateKeyPair,
+  encrypt,
+  decrypt
+};
 
 export interface ECKeyPair {
     publicKey: Uint8Array;
@@ -25,7 +158,7 @@ export class ECIES {
         // secp256k1 anahtar çifti oluştur
         let privateKey: Uint8Array;
         do {
-            privateKey = nacl.randomBytes(32);
+            privateKey = randomBytes(32);
         } while (!secp256k1.privateKeyVerify(privateKey));
 
         const publicKey = secp256k1.publicKeyCreate(privateKey, true);
@@ -48,7 +181,7 @@ export class ECIES {
         // 1. Efemeral anahtar çifti oluştur
         let ephemeralPrivateKey: Uint8Array;
         do {
-            ephemeralPrivateKey = nacl.randomBytes(32);
+            ephemeralPrivateKey = randomBytes(32);
         } while (!secp256k1.privateKeyVerify(ephemeralPrivateKey));
 
         const ephemeralPublicKey = secp256k1.publicKeyCreate(ephemeralPrivateKey, true);
@@ -58,9 +191,7 @@ export class ECIES {
             recipientPubKey,
             ephemeralPrivateKey,
             { hashfn: (x: Uint8Array, y: Uint8Array): Uint8Array => {
-                const hash = new Uint8Array(32);
-                crypto.subtle.digest('SHA-256', new Uint8Array([...x, ...y]))
-                    .then((h: ArrayBuffer) => hash.set(new Uint8Array(h)));
+                const hash = createHash('sha256').update(Buffer.from([...x, ...y])).digest();
                 return hash;
             }}
         );
@@ -70,22 +201,18 @@ export class ECIES {
 
         // 5. Mesajı şifrele
         const messageBytes = typeof message === 'string' ? new TextEncoder().encode(message) : message;
-        const iv = nacl.randomBytes(12);
+        const iv = randomBytes(12);
         const encryptedData = await this.aesGcmEncrypt(encryptionKey, iv, messageBytes);
         const { ciphertext, authTag } = encryptedData;
 
         // 6. MAC hesapla
-        const macData = new Uint8Array([...iv, ...ciphertext, ...authTag]);
-        const mac = await crypto.subtle.sign(
-            { name: 'HMAC', hash: 'SHA-256' },
-            await this.importMacKey(macKey),
-            macData
-        );
+        const macData = Buffer.concat([iv, ciphertext, authTag]);
+        const mac = createHash('sha256').update(macData).digest();
 
         return {
             ephemeralPublicKey,
-            encryptedMessage: new Uint8Array([...iv, ...ciphertext, ...authTag]),
-            mac: new Uint8Array(mac)
+            encryptedMessage: Buffer.from(ciphertext),
+            mac: Buffer.from(mac)
         };
     }
 
@@ -112,9 +239,7 @@ export class ECIES {
             encryptedData.ephemeralPublicKey,
             privKey,
             { hashfn: (x: Uint8Array, y: Uint8Array): Uint8Array => {
-                const hash = new Uint8Array(32);
-                crypto.subtle.digest('SHA-256', new Uint8Array([...x, ...y]))
-                    .then((h: ArrayBuffer) => hash.set(new Uint8Array(h)));
+                const hash = createHash('sha256').update(Buffer.from([...x, ...y])).digest();
                 return hash;
             }}
         );
@@ -124,13 +249,9 @@ export class ECIES {
 
         // 5. MAC'i doğrula
         const { encryptedMessage, mac } = encryptedData;
-        const calculatedMac = await crypto.subtle.sign(
-            { name: 'HMAC', hash: 'SHA-256' },
-            await this.importMacKey(macKey),
-            encryptedMessage
-        );
+        const calculatedMac = createHash('sha256').update(encryptedMessage).digest();
 
-        if (!this.compareUint8Arrays(new Uint8Array(calculatedMac), mac)) {
+        if (!Buffer.from(calculatedMac).equals(Buffer.from(mac))) {
             throw new Error('Geçersiz MAC - mesaj değiştirilmiş olabilir');
         }
 
@@ -160,8 +281,8 @@ export class ECIES {
             ? new TextEncoder().encode(message)
             : message;
 
-        const messageHash = await crypto.subtle.digest('SHA-256', messageBytes);
-        const signature = secp256k1.ecdsaSign(new Uint8Array(messageHash), privKey);
+        const messageHash = createHash('sha256').update(Buffer.from(messageBytes)).digest();
+        const signature = secp256k1.ecdsaSign(messageHash, privKey);
         return signature.signature;
     }
 
@@ -175,10 +296,10 @@ export class ECIES {
         }
 
         try {
-            const messageHash = await crypto.subtle.digest('SHA-256', message);
+            const messageHash = createHash('sha256').update(Buffer.from(message)).digest();
             return secp256k1.ecdsaVerify(
                 signature,
-                new Uint8Array(messageHash),
+                messageHash,
                 publicKey
             );
         } catch (error) {
@@ -191,10 +312,10 @@ export class ECIES {
         encryptionKey: CryptoKey;
         macKey: Uint8Array;
     }> {
-        const salt = nacl.randomBytes(32);
+        const salt = randomBytes(32);
         const info = new TextEncoder().encode('ECIES_Keys');
         
-        const masterKey = await crypto.subtle.importKey(
+        const masterKey = await cryptoModule.subtle.importKey(
             'raw',
             secret,
             { name: 'HKDF' },
@@ -202,7 +323,7 @@ export class ECIES {
             ['deriveBits']
         );
 
-        const derivedBits = await crypto.subtle.deriveBits(
+        const derivedBits = await cryptoModule.subtle.deriveBits(
             {
                 name: 'HKDF',
                 hash: 'SHA-512',
@@ -217,7 +338,7 @@ export class ECIES {
         const encryptionKeyBytes = derivedBytes.slice(0, 32);
         const macKeyBytes = derivedBytes.slice(32);
 
-        const encryptionKey = await crypto.subtle.importKey(
+        const encryptionKey = await cryptoModule.subtle.importKey(
             'raw',
             encryptionKeyBytes,
             { name: 'AES-GCM' },
@@ -231,22 +352,12 @@ export class ECIES {
         };
     }
 
-    private static async importMacKey(keyData: Uint8Array): Promise<CryptoKey> {
-        return await crypto.subtle.importKey(
-            'raw',
-            keyData,
-            { name: 'HMAC', hash: 'SHA-256' },
-            false,
-            ['sign', 'verify']
-        );
-    }
-
     private static async aesGcmEncrypt(
         key: CryptoKey,
         iv: Uint8Array,
         data: Uint8Array
     ): Promise<{ ciphertext: Uint8Array; authTag: Uint8Array }> {
-        const encrypted = await crypto.subtle.encrypt(
+        const encrypted = await cryptoModule.subtle.encrypt(
             { name: 'AES-GCM', iv, tagLength: 128 },
             key,
             data
@@ -265,7 +376,7 @@ export class ECIES {
         ciphertext: Uint8Array,
         authTag: Uint8Array
     ): Promise<Uint8Array> {
-        const decrypted = await crypto.subtle.decrypt(
+        const decrypted = await cryptoModule.subtle.decrypt(
             { name: 'AES-GCM', iv, tagLength: 128 },
             key,
             new Uint8Array([...ciphertext, ...authTag])
@@ -274,9 +385,8 @@ export class ECIES {
         return new Uint8Array(decrypted);
     }
 
-    private static compareUint8Arrays(a: Uint8Array, b: Uint8Array): boolean {
-        if (a.length !== b.length) return false;
-        return a.every((val, i) => val === b[i]);
+    public static compareUint8Arrays(a: Uint8Array, b: Uint8Array): boolean {
+        return Buffer.from(a).equals(Buffer.from(b));
     }
 
     static encodeBase64(data: Uint8Array): string {
